@@ -15,6 +15,12 @@ import { tmpdir } from 'os';
 import yaml from 'js-yaml';
 
 /**
+ * Minimum age before directory age alone may condemn an ownerless lock or
+ * recover guard. See `lockCanRecover` for why the age check needs a floor.
+ */
+export const OWNERLESS_GRACE_MS = 1_000;
+
+/**
  * Rebuild a markdown table row from the cells produced by `line.split('|')`.
  *
  * `split('|')` yields a leading empty element (before the opening `|`) and,
@@ -85,6 +91,45 @@ export function resolveTrackerPath(rootDir) {
       ? join(rootDir, 'data/applications.md')
       : join(rootDir, 'applications.md');
   return canonicalizeTrackerPath(raw);
+}
+
+/**
+ * Resolve the workspace root that owns a tracker, i.e. where `reports/` and
+ * `data/` sit: the tracker's parent in the `data/applications.md` layout, and
+ * the tracker's own directory in the root `applications.md` layout.
+ *
+ * Derive sibling paths from THIS rather than from a script's own location, so
+ * that pointing `CAREER_OPS_TRACKER` at another workspace moves the whole set
+ * together. A script that mixes the two (tracker from the env, manifest from
+ * its own directory) reads one workspace and writes another — which is how the
+ * merge-tracker suite came to read a developer's real `data/pdf-index.tsv`
+ * while writing an isolated temp tracker.
+ *
+ * @param {string} trackerPath - Tracker path, typically from resolveTrackerPath().
+ * @returns {string} Absolute workspace root directory.
+ */
+export function resolveWorkspaceRoot(trackerPath) {
+  const trackerDir = dirname(trackerPath);
+  return basename(trackerDir) === 'data' ? dirname(trackerDir) : trackerDir;
+}
+
+/**
+ * Resolve the PDF manifest (`data/pdf-index.tsv`) for the workspace that owns
+ * a tracker. `CAREER_OPS_PDF_INDEX` overrides it explicitly.
+ *
+ * One definition for every reader, because the manifest path was previously
+ * rebuilt from a literal in each script — and each picked its own base
+ * directory, so `merge-tracker.mjs` derived it from the tracker while
+ * `sync-pdf-flags.mjs` and `find.mjs` used their own install directory. Scripts
+ * that resolve the tracker from `CAREER_OPS_TRACKER` then read one workspace's
+ * manifest against another's tracker (#2471).
+ *
+ * @param {string} trackerPath - Tracker path, typically from resolveTrackerPath().
+ * @returns {string} Absolute path to the PDF manifest.
+ */
+export function resolvePdfIndexPath(trackerPath) {
+  return process.env.CAREER_OPS_PDF_INDEX
+    || join(resolveWorkspaceRoot(trackerPath), 'data', 'pdf-index.tsv');
 }
 
 /**
@@ -203,6 +248,11 @@ function readLockOwner(lockDir) {
   }
 }
 
+function sameLockDirectory(left, right) {
+  return left.dev === right.dev && left.ino === right.ino
+    && (left.ino !== 0 || left.birthtimeMs === right.birthtimeMs);
+}
+
 /**
  * Decide whether an existing lock can be safely recovered.
  *
@@ -212,8 +262,20 @@ function readLockOwner(lockDir) {
  * directory itself is older than the stale threshold, the waiting process may
  * remove the lock and retry acquisition.
  *
+ * That age fallback needs a floor. Two directories are ownerless by
+ * construction, not by accident: a lock between its `mkdirSync` and its
+ * `owner.json` write, and the recover guard, which never carries `owner.json`
+ * at all. Judging those on `age > staleMs` alone lets a caller with an
+ * aggressive staleMs delete a directory created microseconds ago — either
+ * stealing a winner's lock inside its acquisition window, or evicting a live
+ * guard and putting two callers inside the decide-then-delete window the guard
+ * exists to serialize. OWNERLESS_GRACE_MS is a lower bound on that patience,
+ * never a cap: a larger caller staleMs still wins, and a genuinely abandoned
+ * directory still ages out, so a crash while holding the guard cannot disable
+ * recovery for good.
+ *
  * @param {string} lockDir - Directory that represents the active lock.
- * @param {number} staleMs - Age threshold for metadata-free lock recovery.
+ * @param {number} staleMs - Age threshold for metadata-free lock recovery, floored at OWNERLESS_GRACE_MS.
  * @returns {boolean} True when the caller may remove and recreate the lock.
  */
 function lockCanRecover(lockDir, staleMs) {
@@ -221,7 +283,7 @@ function lockCanRecover(lockDir, staleMs) {
   if (owner?.pid) return !processIsAlive(owner.pid);
 
   try {
-    return Date.now() - statSync(lockDir).mtimeMs > staleMs;
+    return Date.now() - statSync(lockDir).mtimeMs > Math.max(staleMs, OWNERLESS_GRACE_MS);
   } catch {
     return true;
   }
@@ -241,8 +303,9 @@ function lockCanRecover(lockDir, staleMs) {
  * @param {object} [options] - Lock timing options.
  * @param {number} [options.timeoutMs=60000] - Maximum time to wait for the lock.
  * @param {number} [options.retryMs=75] - Delay between acquisition attempts.
- * @param {number} [options.staleMs=600000] - Metadata-free stale-lock threshold.
+ * @param {number} [options.staleMs=600000] - Metadata-free stale-lock threshold, floored at OWNERLESS_GRACE_MS.
  * @param {string} [options.tracker] - Tracker path recorded in owner metadata.
+ * @param {Function} [options.removeLock] - Release hook for deterministic fault tests.
  * @returns {Promise<{attempts:number,waitMs:number,staleRecovered:boolean,release:Function}>}
  * Lock handle with metadata and an idempotent release method.
  */
@@ -277,18 +340,68 @@ export async function acquireTrackerLock(lockDir, options = {}) {
         throw ownerErr;
       }
 
+      let ownerVerified = false;
+      let verifiedDir = null;
       let released = false;
+      const removeLock = typeof options.removeLock === 'function'
+        ? options.removeLock
+        : path => rmSync(path, { recursive: true, force: true });
       return {
         attempts,
         waitMs: Date.now() - startedAt,
         staleRecovered,
         release() {
           if (released) return;
-          released = true;
-          const owner = readLockOwner(lockDir);
-          if (owner?.token === token) {
-            rmSync(lockDir, { recursive: true, force: true });
+          if (ownerVerified) {
+            let currentDir;
+            try {
+              currentDir = statSync(lockDir);
+            } catch (err) {
+              if (err?.code === 'ENOENT') {
+                released = true;
+                return;
+              }
+              throw err;
+            }
+            if (!sameLockDirectory(verifiedDir, currentDir)) {
+              released = true;
+              return;
+            }
+            const owner = readLockOwner(lockDir);
+            if (owner && owner.token !== token) {
+              released = true;
+              return;
+            }
+            if (!owner && existsSync(join(lockDir, 'owner.json'))) {
+              throw new Error(`Cannot verify tracker lock ownership at ${lockDir}`);
+            }
+          } else {
+            let beforeRead;
+            try {
+              beforeRead = statSync(lockDir);
+            } catch (err) {
+              if (err?.code === 'ENOENT') {
+                released = true;
+                return;
+              }
+              throw err;
+            }
+            const owner = readLockOwner(lockDir);
+            if (owner?.token !== token) {
+              if (owner) released = true;
+              else throw new Error(`Cannot verify tracker lock ownership at ${lockDir}`);
+              return;
+            }
+            const afterRead = statSync(lockDir);
+            if (!sameLockDirectory(beforeRead, afterRead)) {
+              released = true;
+              return;
+            }
+            ownerVerified = true;
+            verifiedDir = afterRead;
           }
+          removeLock(lockDir);
+          released = true;
         },
       };
     } catch (err) {
@@ -332,6 +445,51 @@ export async function acquireTrackerLock(lockDir, options = {}) {
   const timeoutErr = new Error(`Timed out waiting for tracker lock at ${lockDir}`);
   timeoutErr.code = 'LOCK_TIMEOUT';
   throw timeoutErr;
+}
+
+/**
+ * Open one serialized read/replace transaction for an applications tracker.
+ * Writers receive only the canonical path plus guarded read and atomic replace
+ * operations, keeping the complete mutation inside one shared lock lifetime.
+ */
+export async function openTrackerTransaction(appsFile, options = {}) {
+  const trackerPath = canonicalizeTrackerPath(appsFile);
+  const { lockDir = trackerLockDirFor(trackerPath), ...lockOptions } = options;
+  const lock = await acquireTrackerLock(lockDir, {
+    timeoutMs: Number(process.env.CAREER_OPS_TRACKER_LOCK_TIMEOUT_MS) || 60_000,
+    retryMs: Number(process.env.CAREER_OPS_TRACKER_LOCK_RETRY_MS) || 75,
+    staleMs: Number(process.env.CAREER_OPS_TRACKER_LOCK_STALE_MS) || 10 * 60_000,
+    tracker: trackerPath,
+    ...lockOptions,
+  });
+  let closed = false;
+  let closeError = null;
+  const assertOpen = () => {
+    if (closed) throw new Error('Tracker transaction is already closed');
+  };
+  return {
+    path: trackerPath,
+    read() {
+      assertOpen();
+      return readFileSync(trackerPath, 'utf-8');
+    },
+    replace(content) {
+      assertOpen();
+      writeFileAtomic(trackerPath, content);
+    },
+    close() {
+      if (closed) return closeError;
+      try {
+        lock.release();
+      } catch (err) {
+        closeError = err;
+        console.error(`Warning: tracker transaction closed but lock cleanup failed at ${lockDir}: ${err.message}`);
+      } finally {
+        closed = true;
+      }
+      return closeError;
+    },
+  };
 }
 
 /**
@@ -401,4 +559,79 @@ export function resolveCanonicalState(input, states) {
     if (s.aliases.some(a => a.toLowerCase() === clean)) return s.label;
   }
   return null;
+}
+
+/**
+ * Canonical process-exit codes shared by every locked, single-purpose
+ * tracker-writer CLI (set-status.mjs, mark-pdf-ready.mjs, ...) — one source
+ * so a new script can't drift from the numbering an existing one already
+ * commits to (callers/CI may depend on these exact values).
+ */
+export const CLI_EXIT = { OK: 0, USAGE: 1, NOT_FOUND: 2, AMBIGUOUS: 3, LOCK_TIMEOUT: 4 };
+
+/**
+ * Build a failWith(exitCode, code, message, extra) bound to a --json flag,
+ * shared by every canonical tracker-writer CLI so the JSON-vs-human error
+ * contract can't drift between them.
+ *
+ * With json:true the error object goes to stdout so machine callers always
+ * parse one stream; the human-readable message always goes to stderr.
+ *
+ * @param {boolean} json - The CLI's --json flag.
+ * @returns {(exitCode: number, code: string, message: string, extra?: object) => never}
+ */
+export function makeCliFailWith(json) {
+  return function failWith(exitCode, code, message, extra = {}) {
+    if (json) {
+      console.log(JSON.stringify({ error: message, code, ...extra }));
+    }
+    console.error(`❌ ${message}`);
+    process.exit(exitCode);
+  };
+}
+
+/**
+ * Acquire the shared tracker lock for a locked read-modify-write CLI,
+ * routing any failure through the caller's failWith so every canonical
+ * writer surfaces lock errors identically (LOCK_TIMEOUT → CLI_EXIT.LOCK_TIMEOUT,
+ * anything else → CLI_EXIT.USAGE as a non-retryable config/filesystem error).
+ *
+ * Dry-run never writes, so it must not hold the exclusive lock: a read-only
+ * preview should not block (or be blocked by) another writer — returns null
+ * in that case. Registers the `process.exit` release safety net these CLIs
+ * rely on (failWith/failUsage/row-resolution all exit directly and skip an
+ * explicit release — release() is idempotent, so both firing is fine).
+ *
+ * @param {string} appsFile - Canonical tracker path (resolveTrackerPath()).
+ * @param {{dryRun: boolean, failWith: (exitCode: number, code: string, message: string, extra?: object) => never}} options
+ * @returns {Promise<{release: Function}|null>}
+ */
+export async function acquireTrackerLockForCli(appsFile, { dryRun, failWith }) {
+  if (dryRun) return null;
+  let lock;
+  try {
+    lock = await acquireTrackerLock(trackerLockDirFor(appsFile), {
+      timeoutMs: Number(process.env.CAREER_OPS_TRACKER_LOCK_TIMEOUT_MS) || 60_000,
+      retryMs: Number(process.env.CAREER_OPS_TRACKER_LOCK_RETRY_MS) || 75,
+      staleMs: Number(process.env.CAREER_OPS_TRACKER_LOCK_STALE_MS) || 10 * 60_000,
+      tracker: appsFile,
+    });
+  } catch (err) {
+    // Exit 4 means "lock is busy — retry later" and must stay reserved for
+    // the actual timeout. Filesystem/configuration failures (EACCES on the
+    // lock dir, unwritable owner.json, …) are not retryable and fail as a
+    // config error instead.
+    if (err?.code === 'LOCK_TIMEOUT') {
+      failWith(CLI_EXIT.LOCK_TIMEOUT, 'lock-timeout', err.message);
+    } else {
+      failWith(CLI_EXIT.USAGE, 'lock-error', `Cannot acquire tracker lock: ${err.message}`);
+    }
+    // failWith is documented (and, today, always) to exit the process — but
+    // this function is now shared, so don't let a future non-exiting failWith
+    // silently fall through to releasing/returning an undefined lock; fail
+    // loudly instead.
+    throw err;
+  }
+  process.once('exit', () => lock.release());
+  return lock;
 }
