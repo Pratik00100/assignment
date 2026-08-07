@@ -1,0 +1,2 @@
+run_timestamp,search_type,depart_date,return_date,trip_length_days,cheapest_clean_price,currency,airline,flight_numbers,stops,duration_minutes,layover_airports,candidates_considered,candidates_after_filter
+2026-08-07T11:44:55Z,primary,2026-11-03,2026-12-23,50,2901,AUD,THAI,"TG 462, TG 319",1,1030,BKK,11,4

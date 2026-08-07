@@ -1,0 +1,4 @@
+# track_flights.py uses only the Python standard library (urllib, smtplib,
+# csv, json) so there is nothing to install. This file exists so the
+# GitHub Actions workflow has something predictable to point `pip install -r`
+# at if you later add dependencies (e.g. `requests`).
