@@ -1,6 +1,11 @@
 # Local sandbox scratch scripts (never part of the project)
 .scratch-*
 
+# Session handoff prompts — contain personal contact details and visa status.
+# This repo is public; these must never be committed.
+COWORK-HANDOFF-PROMPT.md
+*-HANDOFF-PROMPT.md
+
 # Personal data (user fills these)
 cv.md
 data/applications.md
