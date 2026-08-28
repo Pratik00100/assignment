@@ -11,9 +11,10 @@ here, so review is the real control.
   author's `career-ops-plugin-<name>` repo; users `add` it. The default, low
   burden.
 - **Bundled** — promoted into `plugins/` (shipped, auto-updated). Reserve for
-  broadly-useful, low/zero-key, well-tested plugins (how `apify`/`gmail`/`notion`
-  were absorbed). Adds a maintenance commitment + a `config/plugins.example.yml`
-  block + an `.env.example` entry.
+  broadly-useful, low/zero-key, well-tested plugins (how `apify`/`gmail`/`notion`/
+  `memory` were absorbed). Adds a maintenance commitment + a
+  `config/plugins.example.yml` block + an `.env.example` entry (when the plugin
+  needs one — a zero-key plugin like `memory` needs neither).
 
 ## What CI already checked (don't re-do by hand)
 
@@ -66,7 +67,7 @@ author" prompt — the project doesn't host that liability in-tree.
 
 ## Bundled plugins are reference seeds (no feature PRs on `plugins/`)
 
-A bundled plugin (`plugins/apify`, `plugins/gmail`, `plugins/notion`) is a
+A bundled plugin (`plugins/apify`, `plugins/gmail`, `plugins/notion`, `plugins/memory`) is a
 **reference seed**: a reviewed, minimal, stable example. We do **not** accept
 feature PRs against it — close-redirect them to "publish `career-ops-plugin-<id>`
 and we'll register it as the maintained successor." Bundled plugins only take

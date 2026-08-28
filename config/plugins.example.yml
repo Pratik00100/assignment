@@ -33,3 +33,8 @@ plugins:
     enabled: false
     # label: "Job Leads"     # the Gmail label to scan
     # days_back: 7           # how far back to look
+
+  # ── memory (export + search) ── local-only archive + recall of your tracker. No keys, no network.
+  # Journal lives at output/memory/history.jsonl (gitignored). Run via `node plugins.mjs run memory export|search`.
+  memory:
+    enabled: false

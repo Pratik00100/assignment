@@ -72,7 +72,7 @@ trust).
    commit we approved.
 
 Broadly-useful, low/zero-key plugins may be shipped **bundled** in `plugins/`
-(e.g. `apify`, `gmail`, `notion`). Bundled plugins are **reference seeds**:
+(e.g. `apify`, `gmail`, `notion`, `memory`). Bundled plugins are **reference seeds**:
 reviewed in-tree, always present, and a working example to copy — kept minimal
 and stable on purpose, **not** a home for ongoing feature work.
 
